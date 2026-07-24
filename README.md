@@ -85,9 +85,24 @@ kalshi-bot/
 ├── README.md            # This file
 ├── .gitignore           # Ignored paths
 └── docs/
-    ├── ARCHITECTURE.md  # Planned design — NOT implemented
+    ├── ARCHITECTURE.md  # System design + defects found in the reference impl
+    ├── APIS.md          # Every API: auth, quotas, costs, alternatives
+    ├── VALIDATION.md    # "Am I actually making money?" methodology
+    ├── OPERATIONS.md    # Running continuously
     └── SETUP.md         # Dev environment & GitHub configuration notes
 ```
+
+## Documentation
+
+| Doc | Read it for |
+| --- | --- |
+| [`ARCHITECTURE.md`](docs/ARCHITECTURE.md) | Pipeline design, fee-aware edge math, and **7 defects** found in the reference implementation |
+| [`APIS.md`](docs/APIS.md) | Kalshi auth/limits/fees, news sources, LLM providers, and a workaround for every failure mode |
+| [`VALIDATION.md`](docs/VALIDATION.md) | How to tell a real edge from a measurement artifact |
+| [`OPERATIONS.md`](docs/OPERATIONS.md) | Always-on hosting, durable storage, alerting on silence |
+
+**Start with [`VALIDATION.md`](docs/VALIDATION.md)** if your goal is deciding whether
+the strategy actually works. It's the part most trading bots get wrong.
 
 ## Configuration
 
@@ -123,15 +138,27 @@ Do not `git add` it.
 
 ## Roadmap
 
-See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the full plan. In brief:
+Full detail in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md). The headline finding
+from research: **a working implementation of this system already exists** in the
+sibling `polymarket-sentiment-agent/` checkout, and despite its name it already
+targets Kalshi (a 322-line Kalshi v2 client, `PAPER`/`RECOMMEND`/`LIVE` modes, Brier
+scoring). It is MIT licensed.
 
-1. Kalshi REST client with authentication
-2. Configuration and secrets loading
-3. Market data ingestion
-4. Strategy interface and a first baseline strategy
-5. Paper-trading execution against Kalshi's demo environment
-6. Risk limits and position sizing
-7. Live execution (only after sustained paper-trading validation)
+The recommended path is therefore **port and fix, not rewrite**:
+
+1. Port the reference implementation; strip Polymarket/x402/frontend extras
+2. Fix the auth-signing bug (signed path omits `/trade-api/v2` → every authenticated call 401s)
+3. Fix the demo base URL and the orderbook price-unit inconsistency
+4. **Add fee modeling and fill-at-ask** — without these, paper P&L overstates reality by ~3–4¢/contract
+5. Replace the flat edge threshold with fee-aware `net_edge()`
+6. Add liquidity, time-to-resolution, and correlation gates
+7. Deploy always-on with durable Postgres
+8. Wire settlement tracking → Brier/calibration
+9. Run to 200+ resolutions against pre-registered criteria
+10. Live only if it beats the market-price benchmark after costs
+
+Steps 2–4 are a few hours of work and determine whether every number after them means
+anything.
 
 ## License
 
