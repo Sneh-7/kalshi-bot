@@ -13,6 +13,9 @@ build/
 .pytest_cache/
 .mypy_cache/
 secrets/
+data/
+*.db
+.venv/
 
 # Local checkout of a separate upstream repo (priyanshshahh/polymarket-sentiment-agent)
 polymarket-sentiment-agent/

@@ -365,13 +365,35 @@ Two functions in `kalshi.py` disagree about units:
 - `get_orderbook()` treats book prices as **dollars**: `yes_asks = [1.0 - float(p) for p, _ in no_rows]`
 
 If the book returns cents (e.g. `62`), the second computes `1.0 - 62 = -61.0` — a
-nonsense negative probability that would propagate into edge calculations. The
-docstring says `price_dollars`, but Kalshi quotes contracts in integer cents.
+nonsense negative probability that would propagate into edge calculations.
 
-**Fix:** verify against a live response and normalize to a single internal unit.
-Recommendation: **store integer cents everywhere internally** and convert only at
-display. Binary contract prices are exactly representable as integers 1–99; floats
-invite rounding drift in P&L accumulation.
+> ### ⚠️ Correction (verified against the live API, 2026-07-24)
+>
+> An earlier revision of this document recommended standardizing on **integer
+> cents**. That was also wrong. The current API returns **dollar-denominated
+> strings** under `*_dollars` field names:
+>
+> ```jsonc
+> "yes_bid_dollars": "0.1490",   // string, already dollars
+> "yes_ask_dollars": "0.1750",
+> "no_bid_dollars":  "0.8250",
+> {"orderbook_fp": {"yes_dollars": [], "no_dollars": [["0.6850","33000.00"]]}}
+> ```
+>
+> Note the orderbook key is `orderbook_fp`, not `orderbook`, and sizes are
+> strings too. Sanity check: `1 − 0.8250 = 0.1750` matches `yes_ask_dollars`. ✅
+>
+> This is exactly why this document says to verify against the API rather than
+> trust any write-up — the verification caught an error in the fix itself.
+
+**Fixed in the port:** a single `to_dollars()` parse point, `orderbook_fp` with a
+legacy-key fallback. See [`PORT-MANIFEST.md`](PORT-MANIFEST.md) defect 5.
+
+**Also discovered:** markets carry **no `category` field at all**, so the source's
+category filter silently discarded 100% of markets. And a scan of 1,200 open
+markets found exactly **one** with a two-sided quote — `status=open` is dominated
+by unquoted provisional multivariate markets, so filtering those out is what makes
+discovery work at all.
 
 ### 6. 🟡 The Bayesian likelihood-ratio constant is unjustified
 

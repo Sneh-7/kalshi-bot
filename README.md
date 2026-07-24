@@ -3,26 +3,49 @@
 A trading bot for [Kalshi](https://kalshi.com), a CFTC-regulated prediction market
 exchange for event contracts.
 
-> **Project status: scaffold.**
-> This repository currently contains a project skeleton only. `main.py` prints
-> `Hello, World!` and there are no dependencies. No exchange integration, trading
-> logic, or strategy code has been written yet.
+> **Project status: running in PAPER mode against Kalshi's demo environment.**
 >
-> The intended design is documented in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
-> Everything described there is a **plan, not an implementation**.
+> The pipeline works end to end — news ingestion, sentiment classification,
+> Bayesian probability, live Kalshi market data, fee-aware edge, risk gates, and
+> simulated fills. It has **not** been validated: no resolved-market sample
+> exists yet, so there is no evidence of an edge. See
+> [`docs/VALIDATION.md`](docs/VALIDATION.md).
+>
+> Ported from a Kalshi conversion of `polymarket-sentiment-agent` (MIT), with
+> **eight defects fixed** on the way in — including three that would have made
+> paper results systematically optimistic. Full accounting in
+> [`docs/PORT-MANIFEST.md`](docs/PORT-MANIFEST.md).
 
 ---
 
 ## What exists today
 
-| Path               | Lines | Contents                                  |
-| ------------------ | ----: | ----------------------------------------- |
-| `main.py`          |     9 | Entry point stub; prints `Hello, World!`  |
-| `requirements.txt` |     1 | Placeholder comment, no packages declared |
-| `README.md`        |     — | This file                                 |
-| `.gitignore`       |     — | Python artifacts, virtualenvs, secrets    |
+```
+kalshi_bot/
+├── config.py           settings; DEMO + PAPER by default
+├── database.py         SQLAlchemy engine, Postgres URL normalization
+├── models.py           audit trail: news → signal → snapshot → trade
+├── fees.py             Kalshi fee model + net-edge  ← did not exist in source
+├── orchestrator.py     the loop
+└── modules/
+    ├── kalshi.py       Trade API v2 client (RSA-PSS signing, books, orders)
+    ├── ingestion.py    RSS scout with source-health tracking
+    ├── intelligence.py LLM classifier + deterministic Bayes
+    ├── market.py       snapshots incl. book depth
+    ├── risk.py         kill switch, liquidity, drawdown, time-to-close
+    └── execution.py    PAPER / RECOMMEND / LIVE
+tests/                  regression tests pinning all 8 fixes
+```
 
-That is the complete tracked codebase.
+Verified working:
+
+```
+$ pytest tests/ -q
+12 passed
+
+$ python3 main.py --once
+tick done: 33 news, 33 signals, 20 markets, 0 considered, 0 traded, 0 rejected
+```
 
 ## Requirements
 
@@ -64,33 +87,33 @@ pip install -r requirements.txt
 ## Running
 
 ```bash
-python3 main.py
+python3 main.py --check    # verify config + connectivity, no trading
+python3 main.py --once     # one loop tick, then exit
+python3 main.py            # run continuously
 ```
 
-Expected output:
+`--check` is the fastest way to confirm your setup: it reports mode, environment,
+whether credentials loaded, and exercises exchange status, market discovery, and
+orderbook parsing.
 
-```
-Hello, World!
-```
+**No API key is needed to start.** Kalshi's market-data endpoints are public, so
+the whole pipeline runs unauthenticated — credentials are only required for
+`LIVE` mode. Similarly, no LLM key is required: the sentiment classifier falls
+back to a keyword heuristic, which also doubles as the baseline the LLM has to
+beat to justify its cost.
 
-If you see that, your environment is working. That is the full extent of current
-functionality.
+## Safety defaults
 
-## Project layout
+| Setting | Default | Meaning |
+| --- | --- | --- |
+| `TRADING_MODE` | `PAPER` | Simulated fills. No orders are placed. |
+| `KALSHI_BASE_URL` | **demo** | Sandbox. Production requires an explicit change. |
+| `MIN_NET_EDGE` | `0.02` | Applied *after* fees and spread |
+| `MAX_BOOK_FRACTION` | `0.25` | Never take more than ¼ of resting depth |
+| `KILL_SWITCH` | DB-backed | Survives restart; auto-trips on daily drawdown |
 
-```
-kalshi-bot/
-├── main.py              # Entry point (stub)
-├── requirements.txt     # Dependencies (empty)
-├── README.md            # This file
-├── .gitignore           # Ignored paths
-└── docs/
-    ├── ARCHITECTURE.md  # System design + defects found in the reference impl
-    ├── APIS.md          # Every API: auth, quotas, costs, alternatives
-    ├── VALIDATION.md    # "Am I actually making money?" methodology
-    ├── OPERATIONS.md    # Running continuously
-    └── SETUP.md         # Dev environment & GitHub configuration notes
-```
+Reaching production with real money requires deliberately changing **two**
+settings. That is intentional.
 
 ## Documentation
 

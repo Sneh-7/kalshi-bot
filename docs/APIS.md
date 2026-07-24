@@ -124,6 +124,40 @@ compromised and rotated rather than scrubbed.
 Market data being public is genuinely useful: **you can build and validate the entire
 data pipeline before creating any API key.**
 
+### Actual response shape (verified live 2026-07-24)
+
+Field names and units are not what most write-ups — or the reference
+implementation — assume. Prices are **dollar-denominated strings**:
+
+```jsonc
+// GET /markets
+"yes_bid_dollars":   "0.1490",   // string, dollars — NOT integer cents
+"yes_ask_dollars":   "0.1750",
+"no_bid_dollars":    "0.8250",
+"liquidity_dollars": "0.0000",
+"volume_24h_fp":     "0.00",
+"yes_bid_size_fp":   "51.00",
+"is_provisional":    true,
+"close_time":        "2026-07-27T23:40:00Z"
+// there is NO "category" field
+
+// GET /markets/{ticker}/orderbook
+{"orderbook_fp": {"yes_dollars": [], "no_dollars": [["0.6850", "33000.00"]]}}
+```
+
+Three consequences worth planning around:
+
+1. **No `category` field.** Category-based filtering is impossible on this
+   endpoint. Filter on title keywords, `is_provisional`, and quote quality.
+2. **`orderbook_fp`, not `orderbook`**, with `yes_dollars` / `no_dollars` keys.
+3. **`status=open` is mostly noise.** A scan of 1,200 open markets found exactly
+   **one** with a two-sided quote — the list is dominated by unquoted provisional
+   multivariate (parlay-style) markets. Filter them out or you'll be pricing
+   markets nobody trades.
+
+Both arrays in the book are **bids**. A NO bid at $p implies a YES ask at $(1−p):
+`1 − 0.8250 = 0.1750`, matching the reported `yes_ask_dollars`.
+
 ### Rate limits
 
 Token-bucket. Most calls cost **10 tokens**.
