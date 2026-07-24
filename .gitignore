@@ -12,5 +12,14 @@ build/
 *.egg-info/
 .pytest_cache/
 .mypy_cache/
+secrets/
+
 # Local checkout of a separate upstream repo (priyanshshahh/polymarket-sentiment-agent)
 polymarket-sentiment-agent/
+
+# Local-only session log: this repo is public and the log contains personal details
+docs/SESSION_LOG.md
+
+# Editor/agent state — may accumulate conversation logs and personal notes
+.lingcode/
+.cursor/
