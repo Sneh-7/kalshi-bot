@@ -301,13 +301,17 @@ async def ingest_once() -> List[NewsItem]:
                 summary=n.summary,
                 published_at=n.published_at,
             )
-            s.add(row)
+            # SAVEPOINT per item: a duplicate-URL IntegrityError rolls back ONLY
+            # this row. A plain session.rollback() here would unwind the whole
+            # transaction and detach every already-inserted row, so the later
+            # refresh() would raise "not persistent within this Session".
             try:
-                s.flush()
+                with s.begin_nested():
+                    s.add(row)
+                    s.flush()
                 inserted.append(row)
             except IntegrityError:
-                s.rollback()          # duplicate URL — already seen
-                continue
+                continue              # duplicate URL — already seen
         for row in inserted:
             s.refresh(row)
         s.expunge_all()
