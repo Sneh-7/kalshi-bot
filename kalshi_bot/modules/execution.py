@@ -31,7 +31,7 @@ from sqlalchemy.exc import IntegrityError
 
 from ..config import settings
 from ..database import session_scope
-from ..fees import fee_for_order, realized_pnl
+from ..fees import fee_for_order, net_edge, realized_pnl
 from ..models import Recommendation, Trade
 from .kalshi import kalshi
 from .risk import TradePlan
@@ -158,39 +158,147 @@ async def _place_live_order(plan: TradePlan) -> Trade:
     )
 
 
+async def _notify(coro_factory) -> None:
+    """Best-effort Telegram send; never let notification failure break a trade."""
+    try:
+        from . import notifier
+        await coro_factory(notifier)
+    except Exception:
+        log.warning("Notification failed", exc_info=True)
+
+
 async def execute(plan: TradePlan) -> Optional[object]:
     """Execute per TRADING_MODE. Returns Recommendation, Trade, or None."""
     mode = settings.trading_mode
 
     if mode == "RECOMMEND":
-        return create_recommendation(plan)
+        rec = create_recommendation(plan)
+        if rec is not None:
+            await _notify(lambda n: n.recommendation_alert(rec))
+        return rec
 
     if mode == "PAPER":
         trade = _record_paper_fill(plan)
     elif mode == "LIVE":
         if not kalshi.has_credentials:
             raise RuntimeError("LIVE mode requires Kalshi credentials")
-        trade = await _place_live_order(plan)
+        trade = await _place_with_fallback(plan)
     else:
         raise ValueError(f"Unknown trading mode {mode!r}")
 
+    saved = _persist_trade(trade, plan.idem_key)
+    if saved is None:
+        return None
+
+    log.info(
+        "%s trade: %s %s %d @ %.2f | fee $%.2f | net edge %.4f",
+        saved.mode, saved.outcome, saved.ticker[:28], saved.contracts,
+        saved.price, saved.entry_fee_usd, saved.net_edge,
+    )
+    await _notify(lambda n: n.trade_alert(saved))
+    return saved
+
+
+def _persist_trade(trade: Trade, idem_key: str) -> Optional[Trade]:
     with session_scope() as s:
         s.add(trade)
         try:
             s.flush()
         except IntegrityError:
             s.rollback()
-            log.info("Trade idempotency hit: %s", plan.idem_key)
+            log.info("Trade idempotency hit: %s", idem_key)
             return None
         s.refresh(trade)
         s.expunge(trade)
-
-    log.info(
-        "%s trade: %s %s %d @ %.2f | fee $%.2f | net edge %.4f",
-        trade.mode, trade.outcome, trade.ticker[:28], trade.contracts,
-        trade.price, trade.entry_fee_usd, trade.net_edge,
-    )
     return trade
+
+
+async def _place_with_fallback(plan: TradePlan) -> Trade:
+    """Place via the Kalshi API; on failure try the browser fallback channel."""
+    try:
+        return await _place_live_order(plan)
+    except Exception as api_err:
+        log.warning("API order failed for %s: %s — trying browser fallback",
+                    plan.ticker, api_err)
+        try:
+            from . import browser_exec
+            trade = await browser_exec.place_order(plan)
+            if trade is not None:
+                return trade
+        except Exception as br_err:
+            log.warning("Browser fallback failed for %s: %s", plan.ticker, br_err)
+        raise api_err
+
+
+# --- approval flow (RECOMMEND mode, driven from Telegram) ----------------
+
+async def approve_recommendation(rec_id: int) -> Optional[Trade]:
+    """Approve a pending recommendation and place the order.
+
+    On production with credentials this places a real Kalshi order (API, with
+    browser fallback). On DEMO / without credentials it records a paper fill so
+    the approval flow is fully testable.
+    """
+    now = datetime.now(timezone.utc)
+    with session_scope() as s:
+        rec = s.get(Recommendation, rec_id)
+        if rec is None or rec.status != "PENDING":
+            return None
+        if rec.expires_at and rec.expires_at < now:
+            rec.status = "EXPIRED"
+            return None
+        plan = TradePlan(
+            ticker=rec.ticker,
+            market_question=rec.market_question,
+            outcome=rec.outcome,
+            side=rec.side,
+            entry_price=rec.suggested_price,
+            contracts=rec.suggested_contracts,
+            size_usd=rec.suggested_size_usd,
+            model_probability=rec.model_probability,
+            breakdown=net_edge(rec.model_probability, rec.suggested_price),
+            market_mid=rec.suggested_price,
+            available_depth=0,
+            close_time="",
+            signal_id=rec.signal_id,
+            snapshot_id=rec.snapshot_id,
+            idem_key=make_idem_key(rec.ticker, rec.outcome, rec.signal_id),
+        )
+        rec.status = "APPROVED"
+        rec.decided_at = now
+        rec_pk = rec.id
+
+    try:
+        if kalshi.has_credentials and not settings.is_demo:
+            trade = await _place_with_fallback(plan)
+        else:
+            trade = _record_paper_fill(plan)
+            trade.notes = "Approved recommendation (paper — no live creds / DEMO)"
+    except Exception:
+        log.exception("Approved order placement failed for %s", plan.ticker)
+        return None
+
+    saved = _persist_trade(trade, plan.idem_key)
+    if saved is None:
+        return None
+
+    with session_scope() as s:
+        rec = s.get(Recommendation, rec_pk)
+        if rec is not None:
+            rec.trade_id = saved.id
+
+    await _notify(lambda n: n.trade_alert(saved))
+    return saved
+
+
+def reject_recommendation(rec_id: int) -> bool:
+    with session_scope() as s:
+        rec = s.get(Recommendation, rec_id)
+        if rec is None or rec.status != "PENDING":
+            return False
+        rec.status = "REJECTED"
+        rec.decided_at = datetime.now(timezone.utc)
+    return True
 
 
 def expire_old_recommendations() -> int:

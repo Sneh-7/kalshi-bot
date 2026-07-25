@@ -76,7 +76,103 @@ async def _check() -> int:
     else:
         print("⏭  skipping authenticated checks (no credentials)")
 
+    # --- optional integrations (informational; don't fail the check) ---
+    if settings.truth_social_enabled:
+        try:
+            from kalshi_bot.modules import ingestion
+            posts = await ingestion._fetch_truth_social()
+            print(f"✅ Truth Social: {len(posts)} recent posts ({settings.truth_social_provider})")
+        except Exception as e:
+            print(f"⚠️  Truth Social failed: {e}")
+    else:
+        print("⏭  Truth Social disabled")
+
+    if settings.telegram_enabled:
+        try:
+            from kalshi_bot.modules import notifier
+            await notifier.send_message("kalshi-bot <code>--check</code> ✅ Telegram OK")
+            print("✅ Telegram send OK")
+        except Exception as e:
+            print(f"⚠️  Telegram failed: {e}")
+    else:
+        print("⏭  Telegram disabled (set TELEGRAM_BOT_TOKEN + TELEGRAM_CHAT_ID)")
+
+    if not settings.analyst_enabled:
+        print("⏭  Claude analyst disabled (ANALYST_ENABLED=false)")
+    elif settings.analyst_provider == "cli":
+        import shutil
+        binary = shutil.which(settings.claude_cli_path)
+        if binary is None:
+            print(f"⚠️  Claude CLI '{settings.claude_cli_path}' not found on PATH")
+        else:
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    binary, "-p", "--output-format", "json",
+                    "--model", settings.analyst_cli_model,
+                    stdin=asyncio.subprocess.PIPE,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                out, err = await asyncio.wait_for(
+                    proc.communicate(input=b"Reply with the word OK."), timeout=60
+                )
+                if proc.returncode == 0:
+                    import json as _json
+                    res = _json.loads(out.decode()).get("result", "").strip()[:40]
+                    print(f"✅ Claude CLI ({settings.analyst_cli_model}): {res}")
+                else:
+                    print(f"⚠️  Claude CLI error: {err.decode()[:120]}")
+            except Exception as e:
+                print(f"⚠️  Claude CLI check failed: {e}")
+    elif settings.anthropic_api_key:
+        try:
+            from anthropic import AsyncAnthropic
+            client = AsyncAnthropic(api_key=settings.anthropic_api_key)
+            r = await client.messages.create(
+                model=settings.analyst_model, max_tokens=16,
+                messages=[{"role": "user", "content": "Reply with the word OK."}],
+            )
+            txt = next((b.text for b in r.content if b.type == "text"), "")
+            print(f"✅ Claude analyst API ({settings.analyst_model}): {txt.strip()[:40]}")
+        except Exception as e:
+            print(f"⚠️  Claude API ping failed: {e}")
+    else:
+        print("⏭  Claude analyst provider=claude but ANTHROPIC_API_KEY unset")
+
     return 0 if ok else 1
+
+
+async def _watchdog() -> None:
+    """Alert over Telegram if the agent loop stops ticking."""
+    from datetime import datetime, timezone
+
+    from kalshi_bot.database import session_scope
+    from kalshi_bot.models import AgentState
+    from kalshi_bot.modules import notifier
+
+    if settings.heartbeat_minutes <= 0:
+        return
+    alerted = False
+    wd_log = logging.getLogger("watchdog")
+    while True:
+        await asyncio.sleep(60)
+        try:
+            with session_scope() as s:
+                row = s.get(AgentState, "last_loop_at")
+            if not row or not row.value:
+                continue
+            last = datetime.fromisoformat(row.value)
+            age_min = (datetime.now(timezone.utc) - last).total_seconds() / 60.0
+            if age_min > settings.heartbeat_minutes:
+                if not alerted:
+                    await notifier.alert(
+                        f"No loop tick for {age_min:.0f} min — agent may be stuck."
+                    )
+                    alerted = True
+            else:
+                alerted = False
+        except Exception:
+            wd_log.exception("watchdog error")
 
 
 async def _main() -> int:
@@ -97,6 +193,7 @@ async def _main() -> int:
         logging.warning("LIVE MODE ON PRODUCTION — real money is at risk")
         logging.warning("=" * 62)
 
+    from kalshi_bot.modules import notifier
     from kalshi_bot.orchestrator import agent_loop, run_once
 
     if args.once:
@@ -104,13 +201,22 @@ async def _main() -> int:
         return 0
 
     agent_loop.start()
+    notifier.control.start()
+    await notifier.send_message(
+        f"🚀 kalshi-bot started — {settings.trading_mode} on "
+        f"{'DEMO' if settings.is_demo else 'PRODUCTION ⚠️'}"
+    )
+    watchdog = asyncio.create_task(_watchdog())
     try:
         while True:
             await asyncio.sleep(3600)
     except (KeyboardInterrupt, asyncio.CancelledError):
         pass
     finally:
+        watchdog.cancel()
         await agent_loop.stop()
+        await notifier.control.stop()
+        await notifier.send_message("🛑 kalshi-bot stopped")
     return 0
 
 

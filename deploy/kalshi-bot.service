@@ -1,0 +1,26 @@
+# systemd unit for running kalshi-bot WITHOUT Docker (venv directly).
+# Install:
+#   sudo cp deploy/kalshi-bot.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now kalshi-bot
+#   journalctl -u kalshi-bot -f        # logs
+#
+# Assumes the repo is at /opt/kalshi with a .venv and a filled-in .env.
+[Unit]
+Description=kalshi-bot trading agent
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/kalshi
+EnvironmentFile=/opt/kalshi/.env
+ExecStart=/opt/kalshi/.venv/bin/python main.py
+Restart=always
+RestartSec=10
+# Hardening (optional).
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

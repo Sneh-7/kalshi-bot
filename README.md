@@ -1,187 +1,155 @@
 # kalshi-bot
 
-A trading bot for [Kalshi](https://kalshi.com), a CFTC-regulated prediction market
-exchange for event contracts.
+An autonomous trading bot for [Kalshi](https://kalshi.com), a CFTC-regulated
+prediction-market exchange. It reads news + Trump's Truth Social posts, has
+**Claude Opus decide the bets**, sizes them with fractional-Kelly, and trades
+across all Kalshi categories except crypto — with special focus on the
+"what will Trump say" speech/mention markets.
 
-> **Project status: running in PAPER mode against Kalshi's demo environment.**
->
-> The pipeline works end to end — news ingestion, sentiment classification,
-> Bayesian probability, live Kalshi market data, fee-aware edge, risk gates, and
-> simulated fills. It has **not** been validated: no resolved-market sample
-> exists yet, so there is no evidence of an edge. See
-> [`docs/VALIDATION.md`](docs/VALIDATION.md).
->
-> Ported from a Kalshi conversion of `polymarket-sentiment-agent` (MIT), with
-> **eight defects fixed** on the way in — including three that would have made
-> paper results systematically optimistic. Full accounting in
-> [`docs/PORT-MANIFEST.md`](docs/PORT-MANIFEST.md).
+> **Status: production build, running in PAPER mode.** The full pipeline works
+> end to end. It has **not** proven an edge yet — the paper week must show
+> Claude's predictions beating the market (see
+> [`docs/VALIDATION.md`](docs/VALIDATION.md)) before any real money moves. That
+> gate is non-negotiable.
 
 ---
 
-## What exists today
+## How it works
+
+```
+Scout        RSS feeds + Truth Social (@realDonaldTrump)         → news
+Pre-filter   cheap sentiment label + Bayesian prior + market match → candidates
+Shortlist    rank by preliminary edge; keep the top N              → finalists
+ANALYST      Claude Opus prices each finalist and decides          → {side, prob,
+             side / probability / confidence / kelly / rationale       confidence…}
+Overseer     fee-aware edge + fractional-Kelly + risk gates        → sized plan
+Trader       PAPER │ RECOMMEND (Telegram approve) │ LIVE           → fill
+Settlement   poll Kalshi resolutions → realized P&L + calibration  → Brier/log-loss
+Notifier     Telegram cards, approvals, /status /pnl /calibration
+```
+
+The LLM does two jobs at two tiers: a **cheap classifier** on every headline, and
+**Claude Opus as the actual decision-maker** on a small shortlist (which bounds
+cost). Probability math stays deterministic and auditable; Claude supplies the
+judgement and can veto a bad news→market match with `SKIP`.
+
+## Layout
 
 ```
 kalshi_bot/
-├── config.py           settings; DEMO + PAPER by default
+├── config.py           all settings (env / .env)
 ├── database.py         SQLAlchemy engine, Postgres URL normalization
-├── models.py           audit trail: news → signal → snapshot → trade
-├── fees.py             Kalshi fee model + net-edge  ← did not exist in source
-├── orchestrator.py     the loop
+├── models.py           audit trail: news → signal → snapshot → trade → resolution
+├── fees.py             Kalshi fee model + net-edge
+├── orchestrator.py     the two-tier loop
 └── modules/
-    ├── kalshi.py       Trade API v2 client (RSA-PSS signing, books, orders)
-    ├── ingestion.py    RSS scout with source-health tracking
-    ├── intelligence.py LLM classifier + deterministic Bayes
+    ├── kalshi.py       Trade API v2 client (RSA-PSS signing, books, orders, settle)
+    ├── ingestion.py    RSS + Truth Social scout, source-health tracking
+    ├── intelligence.py Tier-1 sentiment classifier + deterministic Bayes
+    ├── analyst.py      Tier-2 Claude Opus decision (CLI / API / Groq fallback)
     ├── market.py       snapshots incl. book depth
-    ├── risk.py         kill switch, liquidity, drawdown, time-to-close
-    └── execution.py    PAPER / RECOMMEND / LIVE
-tests/                  regression tests pinning all 8 fixes
+    ├── risk.py         Kelly sizing, kill switch, liquidity, drawdown gates
+    ├── execution.py    PAPER / RECOMMEND / LIVE + approval flow
+    ├── notifier.py     Telegram alerts + control
+    ├── settlement.py   resolution polling + Brier/log-loss calibration
+    └── browser_exec.py optional Playwright fallback execution
+tests/                  regression + new-module tests  (pytest → 20 passed)
 ```
 
-Verified working:
+## The Claude engine: CLI vs API
 
-```
-$ pytest tests/ -q
-12 passed
+Claude makes the decisions three ways, set by `ANALYST_PROVIDER`:
 
-$ python3 main.py --once
-tick done: 33 news, 33 signals, 20 markets, 0 considered, 0 traded, 0 rejected
-```
+| Provider | Auth | Best for |
+| --- | --- | --- |
+| `cli` | your Claude **subscription** (runs `claude -p`) | local dev on your Mac, no API bill |
+| `claude` | **API key** (`ANTHROPIC_API_KEY`) | 24/7 servers — reliable, headless |
+| `groq` | Groq key (free) | fallback / cheapest |
 
-## Requirements
+The chain always falls back Claude → Groq → deterministic heuristic, so an outage
+never hard-stops the loop. Use `cli` locally; use `claude` when hosted.
 
-- Python 3.9 or newer (3.11+ recommended)
-- macOS, Linux, or WSL
-
-Verify your interpreter:
-
-```bash
-python3 --version
-```
-
-## Setup
-
-Clone and enter the repository:
-
-```bash
-git clone https://github.com/Sneh-7/kalshi-bot.git
-cd kalshi-bot
-```
-
-Create and activate a virtual environment. This keeps project packages isolated
-from your system Python:
+## Quick start (local)
 
 ```bash
 python3 -m venv .venv
-source .venv/bin/activate        # Windows: .venv\Scripts\activate
-```
-
-Install dependencies:
-
-```bash
+source .venv/bin/activate
 pip install -r requirements.txt
+cp example.env .env          # then fill in keys (see the file's inline notes)
+python3 main.py --check      # verifies Kalshi, Truth Social, Telegram, Claude
 ```
 
-> `requirements.txt` is currently empty, so this is a no-op today. It will
-> matter once real dependencies land.
-
-## Running
+Run it:
 
 ```bash
-python3 main.py --check    # verify config + connectivity, no trading
-python3 main.py --once     # one loop tick, then exit
-python3 main.py            # run continuously
+python3 main.py --check      # config + connectivity, no trading
+python3 main.py --once       # a single loop tick, then exit
+python3 main.py              # run continuously
 ```
 
-`--check` is the fastest way to confirm your setup: it reports mode, environment,
-whether credentials loaded, and exercises exchange status, market discovery, and
-orderbook parsing.
+**Minimum to start a paper run:** nothing paid. `ANALYST_PROVIDER=cli` uses your
+subscription; Kalshi market data is public; Truth Social + RSS are free. Add a
+free `GROQ_API_KEY` (fallback) and `TELEGRAM_*` (phone alerts) if you want them.
 
-**No API key is needed to start.** Kalshi's market-data endpoints are public, so
-the whole pipeline runs unauthenticated — credentials are only required for
-`LIVE` mode. Similarly, no LLM key is required: the sentiment classifier falls
-back to a keyword heuristic, which also doubles as the baseline the LLM has to
-beat to justify its cost.
+## Running it 24/7 (hosted)
+
+You can't leave a laptop on all week. Deploy to a cheap/free always-on box with
+Docker — the repo ships a `Dockerfile` and `docker-compose.yml` (auto-restart,
+persistent SQLite volume). On a server, use `ANALYST_PROVIDER=claude` +
+`ANTHROPIC_API_KEY`. **Full walkthrough (incl. free Oracle Cloud):**
+[`docs/DEPLOY.md`](docs/DEPLOY.md).
+
+## The paper week
+
+Start here before anything else: [`docs/PAPER_WEEK.md`](docs/PAPER_WEEK.md) — what
+you need, how to launch it, and how to read the calibration result that decides
+whether the strategy is real.
 
 ## Safety defaults
 
 | Setting | Default | Meaning |
 | --- | --- | --- |
-| `TRADING_MODE` | `PAPER` | Simulated fills. No orders are placed. |
-| `KALSHI_BASE_URL` | **demo** | Sandbox. Production requires an explicit change. |
-| `MIN_NET_EDGE` | `0.02` | Applied *after* fees and spread |
-| `MAX_BOOK_FRACTION` | `0.25` | Never take more than ¼ of resting depth |
-| `KILL_SWITCH` | DB-backed | Survives restart; auto-trips on daily drawdown |
+| `TRADING_MODE` | `PAPER` | Simulated fills. No orders placed. |
+| `KALSHI_BASE_URL` | **demo** | Sandbox. Production is an explicit change. |
+| `ANALYST_PROVIDER` | `claude`→ set `cli` locally | Claude decides; Groq fallback |
+| `MIN_NET_EDGE` | `0.02` | Applied *after* fees + spread |
+| `MAX_TRADE_FRACTION` | `0.05` | ≤5% of deployable capital per trade |
+| `MAX_BOOK_FRACTION` | `0.25` | Never take >¼ of resting depth |
+| `DAILY_DRAWDOWN_USD` | `75` | Auto-trips the kill switch |
 
-Reaching production with real money requires deliberately changing **two**
-settings. That is intentional.
+Reaching production with real money requires deliberately changing
+`KALSHI_BASE_URL` **and** `TRADING_MODE`, plus adding Kalshi credentials. That is
+intentional.
 
 ## Documentation
 
 | Doc | Read it for |
 | --- | --- |
-| [`ARCHITECTURE.md`](docs/ARCHITECTURE.md) | Pipeline design, fee-aware edge math, and **7 defects** found in the reference implementation |
-| [`APIS.md`](docs/APIS.md) | Kalshi auth/limits/fees, news sources, LLM providers, and a workaround for every failure mode |
-| [`VALIDATION.md`](docs/VALIDATION.md) | How to tell a real edge from a measurement artifact |
-| [`OPERATIONS.md`](docs/OPERATIONS.md) | Always-on hosting, durable storage, alerting on silence |
+| [`PAPER_WEEK.md`](docs/PAPER_WEEK.md) | **Start here** — running the paper week and reading the result |
+| [`PRODUCTION.md`](docs/PRODUCTION.md) | The production build: analyst, Truth Social, Telegram, settlement |
+| [`DEPLOY.md`](docs/DEPLOY.md) | 24/7 hosting on a VPS / free Oracle Cloud, Docker + systemd |
+| [`VALIDATION.md`](docs/VALIDATION.md) | Telling a real edge from a measurement artifact |
+| [`ARCHITECTURE.md`](docs/ARCHITECTURE.md) | Pipeline design, fee-aware edge math, the fixed defects |
+| [`APIS.md`](docs/APIS.md) | Kalshi auth/limits/fees, news sources, LLM providers |
+| [`OPERATIONS.md`](docs/OPERATIONS.md) | Durable storage, alerting on silence |
 
-**Start with [`VALIDATION.md`](docs/VALIDATION.md)** if your goal is deciding whether
-the strategy actually works. It's the part most trading bots get wrong.
+## Configuration & secrets
 
-## Configuration
+All config lives in `.env` (copied from [`example.env`](example.env), which
+documents every key with what it's for and how to get it). `.env`, `secrets/`,
+and `data/` are gitignored.
 
-No configuration is required yet. When exchange integration is added, credentials
-will be read from a `.env` file, which is already listed in `.gitignore`.
-
-**Never commit credentials.** This repository is public. Anything committed here is
-world-readable, and secrets pushed to a public repo should be treated as
-compromised even after deletion — git retains history, and automated scrapers
-index public pushes quickly.
-
-A future `.env` will look roughly like:
-
-```bash
-KALSHI_API_KEY_ID=...
-KALSHI_PRIVATE_KEY_PATH=./secrets/kalshi_key.pem
-KALSHI_ENV=demo          # demo | prod
-```
+**Never commit credentials.** This repository is public — anything pushed here is
+world-readable, and a leaked key should be treated as compromised even after
+deletion (git keeps history).
 
 ## A note on `polymarket-sentiment-agent/`
 
-You may see a `polymarket-sentiment-agent/` directory in your working copy. It is
-**deliberately excluded** from this repository via `.gitignore`.
-
-It is a separate upstream project
-([`priyanshshahh/polymarket-sentiment-agent`](https://github.com/priyanshshahh/polymarket-sentiment-agent))
-that happens to be checked out inside this folder. It has its own git history and
-its own remote. It was previously committed here by accident as a broken gitlink —
-a submodule pointer with no `.gitmodules` file — which would have produced an empty,
-uninitializable directory for anyone cloning this repo. That entry has been removed.
-
-Do not `git add` it.
-
-## Roadmap
-
-Full detail in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md). The headline finding
-from research: **a working implementation of this system already exists** in the
-sibling `polymarket-sentiment-agent/` checkout, and despite its name it already
-targets Kalshi (a 322-line Kalshi v2 client, `PAPER`/`RECOMMEND`/`LIVE` modes, Brier
-scoring). It is MIT licensed.
-
-The recommended path is therefore **port and fix, not rewrite**:
-
-1. Port the reference implementation; strip Polymarket/x402/frontend extras
-2. Fix the auth-signing bug (signed path omits `/trade-api/v2` → every authenticated call 401s)
-3. Fix the demo base URL and the orderbook price-unit inconsistency
-4. **Add fee modeling and fill-at-ask** — without these, paper P&L overstates reality by ~3–4¢/contract
-5. Replace the flat edge threshold with fee-aware `net_edge()`
-6. Add liquidity, time-to-resolution, and correlation gates
-7. Deploy always-on with durable Postgres
-8. Wire settlement tracking → Brier/calibration
-9. Run to 200+ resolutions against pre-registered criteria
-10. Live only if it beats the market-price benchmark after costs
-
-Steps 2–4 are a few hours of work and determine whether every number after them means
-anything.
+That directory is a separate upstream project
+([`priyanshshahh/polymarket-sentiment-agent`](https://github.com/priyanshshahh/polymarket-sentiment-agent),
+MIT) checked out inside this folder. It has its own git history and is
+**excluded via `.gitignore`**. Do not `git add` it. Attribution is in
+[`NOTICE`](NOTICE).
 
 ## License
 

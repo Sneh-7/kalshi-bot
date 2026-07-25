@@ -3,14 +3,16 @@
 **Researched and written 2026-07-24.** API details verified against Kalshi's official
 docs on that date; see [`APIS.md`](APIS.md) for sources and re-verification notes.
 
-> ## Status: design document. Nothing in *this* repo is implemented.
+> ## Status: IMPLEMENTED. This document is now design rationale, not a to-do list.
 >
-> This repo (`kalshi-bot`) is still a scaffold — `main.py` prints `Hello, World!`.
->
-> **However, a working implementation of almost exactly this system already exists**
-> in the sibling checkout `polymarket-sentiment-agent/`, and it already targets
-> Kalshi. The central recommendation of this document is therefore **port and fix
-> that code rather than write this from scratch.** See [Build strategy](#build-strategy).
+> The system described here is built and running in PAPER mode. The port-and-fix
+> plan below was carried out (all defects fixed), and the system was then extended
+> into a production build: **Claude Opus is now the decision-maker** (not just a
+> classifier), plus Truth Social ingestion, Telegram control, settlement/calibration,
+> fractional-Kelly sizing, and a Docker deploy. For the current, as-built system see
+> **[`PRODUCTION.md`](PRODUCTION.md)**; to run it see **[`PAPER_WEEK.md`](PAPER_WEEK.md)**
+> and **[`DEPLOY.md`](DEPLOY.md)**. The sections below remain accurate as the
+> reasoning behind the design (edge math, defects, risk model).
 
 ---
 

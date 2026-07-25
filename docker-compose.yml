@@ -1,0 +1,18 @@
+# kalshi-bot 24/7 runner.
+#   docker compose up -d --build      start / rebuild
+#   docker compose logs -f            watch logs
+#   docker compose down               stop
+#
+# Config comes from .env (not baked into the image). The ./data volume keeps the
+# SQLite audit trail across restarts; ./secrets holds the Kalshi PEM (live only).
+services:
+  bot:
+    build: .
+    container_name: kalshi-bot
+    env_file: .env
+    restart: unless-stopped
+    volumes:
+      - ./data:/app/data
+      - ./secrets:/app/secrets:ro
+    # Optional: run `--check` instead of the loop for a one-off health test:
+    #   docker compose run --rm bot python main.py --check

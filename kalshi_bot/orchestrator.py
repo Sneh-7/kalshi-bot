@@ -26,7 +26,16 @@ from .models import (
     PredictionRecord,
     Signal,
 )
-from .modules import execution, ingestion, intelligence, market as oracle, risk
+from .modules import (
+    analyst,
+    execution,
+    ingestion,
+    intelligence,
+    market as oracle,
+    notifier,
+    risk,
+    settlement,
+)
 
 log = logging.getLogger("orchestrator")
 
@@ -126,6 +135,21 @@ def _log_prediction(
         log.exception("Failed to log prediction for signal %s", getattr(sig, "id", "?"))
 
 
+def _headlines_for(
+    sig: Signal, news_titles: Dict[int, str], all_titles: List[str]
+) -> List[str]:
+    """Related headline context for the analyst: the signal's own headline first,
+    then other same-topic headlines from this tick."""
+    own = news_titles.get(sig.news_item_id or -1)
+    kws = _TOPIC_KEYWORDS.get((sig.topic or "").upper(), [])
+    rel = [t for t in all_titles if kws and any(k in t.lower() for k in kws)]
+    out: List[str] = []
+    if own:
+        out.append(own)
+    out += [t for t in rel if t != own]
+    return out[:8] or all_titles[:8]
+
+
 async def _analyze(item: NewsItem) -> Optional[Signal]:
     extr = await intelligence.extract(item.title, item.summary or "")
     posterior, lr = intelligence.bayesian_update(0.5, extr.sentiment, extr.confidence)
@@ -182,42 +206,96 @@ async def run_once() -> None:
 
     considered = traded = rejected = 0
 
-    # 4-6) Decide -> risk -> execute
+    # 4) PRE-FILTER (cheap): match each signal to a market, compute a preliminary
+    # Bayesian edge, and rank. Only the strongest few reach Claude — this is what
+    # bounds Opus cost.
+    news_titles = {it.id: it.title for it in new_items}
+    all_titles = list(news_titles.values())
+    truth_posts = ingestion.recent_truth_social(6)
+
+    ranked: List[Tuple[Signal, MarketSnapshot, float, float]] = []
     for sig in signals:
         if sig.confidence < settings.min_signal_confidence:
             continue
-
         snap = _match_market(sig, snapshots)
         if snap is None:
             continue
-
-        considered += 1
-
-        # Bayesian posterior, seeded with the market's own price as the prior.
-        # Using the market as prior means we only move away from it when the
-        # news genuinely warrants it.
-        target, _lr = intelligence.bayesian_update(
+        prelim_target, _lr = intelligence.bayesian_update(
             snap.price, sig.sentiment, sig.confidence
         )
-
-        # Direction: buy YES if we think it's underpriced, else buy NO.
-        if target > snap.price:
-            outcome, entry_price, depth = "YES", snap.best_ask, snap.ask_depth
-            model_prob = target
+        if prelim_target > snap.price:
+            p_prob, p_entry = prelim_target, snap.best_ask
         else:
-            # Buying NO at (1 - yes_bid); our NO probability is (1 - target).
-            outcome, entry_price, depth = "NO", round(1.0 - snap.best_bid, 4), snap.bid_depth
-            model_prob = round(1.0 - target, 4)
+            p_prob, p_entry = round(1.0 - prelim_target, 4), round(1.0 - snap.best_bid, 4)
+        prelim = net_edge(
+            model_probability=p_prob, entry_price=p_entry,
+            best_bid=snap.best_bid, best_ask=snap.best_ask, is_taker=True,
+        )
+        ranked.append((sig, snap, prelim_target, prelim.net_edge))
 
-        breakdown = net_edge(
-            model_probability=model_prob,
-            entry_price=entry_price,
+    ranked.sort(key=lambda r: r[3], reverse=True)
+    passing = [r for r in ranked if r[3] >= settings.analyst_prelim_min_edge]
+    finalists = passing[: settings.analyst_max_finalists]
+    remainder = passing[settings.analyst_max_finalists:] + [
+        r for r in ranked if r[3] < settings.analyst_prelim_min_edge
+    ]
+
+    # Paused (via Telegram /pause): don't open trades or spend on the analyst,
+    # but still record predictions so calibration data keeps accruing.
+    if notifier.is_paused():
+        for sig, snap, prelim_target, _pe in ranked:
+            _log_prediction(
+                sig, snap, prelim_target, 0.0, 0.0,
+                traded=False, skip_reason="paused",
+            )
+        finalists, remainder = [], []
+
+    # 5) ANALYST (Claude Opus): the actual bet decision on each finalist.
+    for sig, snap, prelim_target, _pe in finalists:
+        considered += 1
+        cand = analyst.Candidate(
+            ticker=snap.ticker,
+            question=snap.question,
+            yes_mid=snap.price,
             best_bid=snap.best_bid,
             best_ask=snap.best_ask,
-            is_taker=True,
+            close_time=snap.close_time,
+            signal_sentiment=sig.sentiment or "neutral",
+            signal_confidence=float(sig.confidence or 0.0),
+            signal_rationale=sig.rationale or "",
+            topic=sig.topic or "GEN",
+            prelim_probability=prelim_target,
+            headlines=_headlines_for(sig, news_titles, all_titles),
+            truth_posts=truth_posts,
         )
+        try:
+            decision = await analyst.analyze_finalist(cand)
+        except Exception:
+            log.exception("Analyst failed for %s", snap.ticker)
+            continue
 
-        contracts = contracts_for_budget(settings.max_usd_per_trade, entry_price)
+        if not decision.is_trade:
+            _log_prediction(
+                sig, snap, decision.probability, 0.0, 0.0,
+                traded=False, skip_reason=f"analyst SKIP ({decision.provider})",
+            )
+            continue
+
+        # Translate the analyst side into a concrete order against the book.
+        if decision.side == "YES":
+            outcome, entry_price, depth = "YES", snap.best_ask, snap.ask_depth
+            model_prob = decision.probability
+        else:
+            outcome, entry_price, depth = "NO", round(1.0 - snap.best_bid, 4), snap.bid_depth
+            model_prob = round(1.0 - decision.probability, 4)
+
+        breakdown = net_edge(
+            model_probability=model_prob, entry_price=entry_price,
+            best_bid=snap.best_bid, best_ask=snap.best_ask, is_taker=True,
+        )
+        contracts = risk.kelly_contracts(
+            model_prob, entry_price, decision.kelly_fraction, depth
+        )
         plan = risk.TradePlan(
             ticker=snap.ticker,
             market_question=snap.question,
@@ -236,19 +314,22 @@ async def run_once() -> None:
             idem_key=execution.make_idem_key(snap.ticker, outcome, sig.id),
         )
 
-        decision = risk.evaluate(plan)
-        if not decision.approved:
+        r_decision = risk.evaluate(plan)
+        if not r_decision.approved:
             rejected += 1
             _log_prediction(
                 sig, snap, model_prob, breakdown.raw_edge, breakdown.net_edge,
-                traded=False, skip_reason=decision.reason,
+                traded=False, skip_reason=f"{r_decision.reason} | {decision.provider}",
             )
-            risk.record_event("risk", "INFO", f"Rejected: {decision.reason}",
-                              {"ticker": snap.ticker, "net_edge": breakdown.net_edge})
+            risk.record_event(
+                "risk", "INFO", f"Rejected: {r_decision.reason}",
+                {"ticker": snap.ticker, "net_edge": breakdown.net_edge,
+                 "provider": decision.provider},
+            )
             continue
 
         try:
-            result = await execution.execute(decision.plan)
+            result = await execution.execute(r_decision.plan)
             if result is not None:
                 traded += 1
             _log_prediction(
@@ -258,6 +339,14 @@ async def run_once() -> None:
         except Exception as e:
             log.exception("Execution failed")
             risk.record_event("trade", "ERROR", f"Execution failed: {e}", {})
+
+    # 6) Log non-finalist candidates too, so calibration is not biased toward
+    # only the markets that passed the shortlist gate.
+    for sig, snap, prelim_target, _pe in remainder:
+        _log_prediction(
+            sig, snap, prelim_target, 0.0, 0.0,
+            traded=False, skip_reason="not shortlisted for analyst",
+        )
 
     # 7) Mark to market against the freshest snapshots.
     quotes: Dict[str, Tuple[float, float]] = {
@@ -276,6 +365,15 @@ async def run_once() -> None:
         execution.mark_to_market(_lookup)
     except Exception:
         log.exception("Mark-to-market failed")
+
+    # 8) Settlement (throttled): learn ground truth, close resolved positions,
+    # keep the calibration record honest.
+    try:
+        n_resolved = await settlement.maybe_poll()
+        if n_resolved:
+            log.info("Settlement: %d markets resolved this poll", n_resolved)
+    except Exception:
+        log.exception("Settlement poll failed")
 
     _set_state("last_loop_at", datetime.now(timezone.utc).isoformat())
     log.info(

@@ -9,3 +9,13 @@ cryptography==43.0.3
 
 # Postgres driver — required for durable always-on runs (see docs/OPERATIONS.md).
 psycopg2-binary==2.9.12
+
+# Claude — Tier-2 analyst that makes the actual bet decisions (claude-opus-4-8).
+anthropic==0.69.0
+
+# --- Optional ---------------------------------------------------------------
+# Browser fallback execution channel (kalshi_bot/modules/browser_exec.py).
+# Only needed if you enable the Playwright/Claude-in-Chrome fallback; it pulls
+# a large browser binary, so it is NOT installed by default. To enable:
+#   pip install playwright==1.48.0 && python -m playwright install chromium
+# playwright==1.48.0

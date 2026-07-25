@@ -300,6 +300,16 @@ class KalshiClient:
             params["tickers"] = ",".join(tickers)
         return await self._request("GET", "/markets", params=params)
 
+    async def get_market(self, ticker: str) -> Dict[str, Any]:
+        """Single market, including settlement `status` and `result`.
+
+        Response shape: {"market": {..., "status": "settled"|"active"|...,
+        "result": "yes"|"no"|""}}. Used by the settlement poller to learn ground
+        truth once a market resolves.
+        """
+        data = await self._request("GET", f"/markets/{ticker}")
+        return (data or {}).get("market", data) or {}
+
     async def get_orderbook(self, ticker: str, depth: int = 10) -> OrderBook:
         """Normalized YES-side book.
 
@@ -362,6 +372,7 @@ class KalshiClient:
         out: List[KalshiMarket] = []
         cursor: Optional[str] = None
         seen = 0
+        excluded = settings.exclude_keyword_list
 
         for _ in range(max_pages):
             data = await self.get_markets(cursor=cursor)
@@ -375,6 +386,11 @@ class KalshiClient:
                     continue
                 if settings.require_two_sided_quote and not mk.has_two_sided_quote:
                     continue
+                # Drop out-of-scope categories (crypto) by title/ticker match.
+                if excluded:
+                    blob = f"{mk.title} {mk.event_ticker} {mk.series_ticker} {mk.ticker}".lower()
+                    if any(k in blob for k in excluded):
+                        continue
                 out.append(mk)
             cursor = data.get("cursor")
             if not cursor:

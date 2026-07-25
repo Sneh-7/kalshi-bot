@@ -194,6 +194,47 @@ def evaluate(plan: TradePlan, count_pending: bool = True) -> RiskDecision:
     return RiskDecision(True, plan)
 
 
+def kelly_contracts(
+    model_probability: float,
+    entry_price: float,
+    analyst_kelly: float,
+    available_depth: int = 0,
+) -> int:
+    """Whole contracts to buy under a fractional-Kelly sizing rule (MODERATE).
+
+    For a binary contract bought at cost `c` that pays $1 on a win with win
+    probability `p`, the full-Kelly bankroll fraction is:
+
+        f* = (p - c) / (1 - c)        (0 when p <= c)
+
+    We stake a *fraction* of that: the global `kelly_fraction` safety multiplier
+    (e.g. 0.5 = half-Kelly) times the analyst's own `analyst_kelly` conviction
+    (0..1). Full Kelly on correlated, news-driven bets is a fast way to ruin;
+    both multipliers only ever shrink the stake. The dollar stake is then capped
+    by `max_trade_fraction` of deployable capital, by `max_usd_per_trade`, and by
+    a fraction of resting book depth.
+    """
+    c = min(max(entry_price, 0.01), 0.99)
+    p = min(max(model_probability, 0.0), 1.0)
+    if p <= c:
+        return 0
+
+    f_star = (p - c) / (1.0 - c)
+    frac = max(0.0, min(1.0, settings.kelly_fraction)) * max(0.0, min(1.0, analyst_kelly))
+    stake = f_star * frac * settings.deployable_capital_usd
+
+    cap = min(
+        settings.max_trade_fraction * settings.deployable_capital_usd,
+        settings.max_usd_per_trade,
+    )
+    stake = min(stake, cap)
+
+    contracts = contracts_for_budget(stake, c)
+    if available_depth > 0:
+        contracts = min(contracts, int(available_depth * settings.max_book_fraction))
+    return max(0, contracts)
+
+
 def record_event(component: str, level: str, message: str, data: Optional[dict] = None) -> None:
     """Structured log row. Rejections belong here — they are data."""
     try:

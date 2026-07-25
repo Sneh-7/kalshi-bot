@@ -1,0 +1,17 @@
+.venv
+data
+secrets
+*.db
+.env
+.git
+.gitignore
+__pycache__
+*.pyc
+*.pyo
+tests
+docs
+polymarket-sentiment-agent
+example.env
+.env.example
+README.md
+NOTICE
